@@ -14,6 +14,7 @@
  */
 
 import { execSync } from 'child_process';
+import { randomBytes } from 'crypto';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -22,6 +23,13 @@ import Cloudflare from 'cloudflare';
 
 // Get current directory for ES modules
 const __filename = fileURLToPath(import.meta.url);
+
+/**
+ * Generate a secure random secret string
+ */
+function generateSecureSecret(length: number = 32): string {
+	return randomBytes(length).toString('hex');
+}
 const __dirname = dirname(__filename);
 const PROJECT_ROOT = join(__dirname, '..');
 
@@ -1766,6 +1774,12 @@ class CloudflareDeploymentManager {
 				value = this.env.CLOUDFLARE_AI_GATEWAY_TOKEN;
 			}
 			
+			// Auto-generate JWT_SECRET and WEBHOOK_SECRET if not present
+			if ((varName === 'JWT_SECRET' || varName === 'WEBHOOK_SECRET') && (!value || value === '')) {
+				value = generateSecureSecret();
+				console.log(`🔐 Generated ${varName} (not provided in environment)`);
+			}
+			
 			if (value && value !== '') {
 				// Skip placeholder values
 				if (
@@ -1848,6 +1862,67 @@ class CloudflareDeploymentManager {
 			console.warn(
 				'   You may need to update secrets manually if required',
 			);
+		}
+	}
+
+	/**
+	 * Checks if Workers Paid subscription is present on the account
+	 */
+	private async checkWorkersPaidSubscription(): Promise<boolean> {
+		console.log('🔍 Checking for Workers Paid subscription...');
+
+		try {
+			const response = await fetch(
+				`https://api.cloudflare.com/client/v4/accounts/${this.env.CLOUDFLARE_ACCOUNT_ID}/subscriptions`,
+				{
+					headers: {
+						Authorization: `Bearer ${this.env.CLOUDFLARE_API_TOKEN}`,
+					},
+				},
+			);
+
+			if (!response.ok) {
+				console.warn(`⚠️  Could not fetch subscriptions: ${response.status} ${response.statusText}`);
+				return true; // Assume available if we can't check
+			}
+
+			const data = await response.json() as {
+				success: boolean;
+				result?: Array<{
+					id: string;
+					product?: { name: string };
+					rate_plan?: { id: string; public_name: string };
+				}>;
+			};
+
+			if (!data.success || !data.result) {
+				console.warn('⚠️  Could not verify subscriptions');
+				return true; // Assume available if we can't check
+			}
+
+			// Look for Workers Paid subscription
+			const workersPaid = data.result.find(
+				(sub) =>
+					sub.product?.name?.toLowerCase().includes('workers') ||
+					sub.rate_plan?.id?.toLowerCase().includes('workers_paid') ||
+					sub.rate_plan?.public_name?.toLowerCase().includes('workers paid')
+			);
+
+			if (workersPaid) {
+				console.log(`✅ Workers Paid subscription found: ${workersPaid.rate_plan?.public_name || workersPaid.product?.name}`);
+				return true;
+			}
+
+			console.warn('⚠️  Workers Paid subscription NOT found');
+			console.warn('   This deployment requires a Workers Paid plan for full functionality');
+			console.warn('   Subscribe at: https://dash.cloudflare.com?to=/:account/workers/plans');
+			return false;
+
+		} catch (error) {
+			console.warn(
+				`⚠️  Could not check Workers subscription: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return true; // Assume available if we can't check
 		}
 	}
 
@@ -1976,8 +2051,14 @@ class CloudflareDeploymentManager {
 
 			console.log('✅ Configuration files updated successfully!\n');
 
-			// Step 1.5: Check dispatch namespace availability early
-			console.log('\n📋 Step 1.5: Checking dispatch namespace availability...');
+			// Step 1.5: Check Workers Paid subscription and dispatch namespace availability
+			console.log('\n📋 Step 1.5: Checking account subscriptions...');
+			const hasWorkersPaid = await this.checkWorkersPaidSubscription();
+			if (!hasWorkersPaid) {
+				console.warn('⚠️  Continuing deployment without Workers Paid - some features may be limited');
+			}
+			
+			console.log('\n📋 Step 1.6: Checking dispatch namespace availability...');
 			const dispatchNamespacesAvailable = await this.checkDispatchNamespaceAvailability();
 			
 			// Comment out dispatch_namespaces in wrangler.jsonc if not available
